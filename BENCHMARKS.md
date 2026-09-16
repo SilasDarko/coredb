@@ -1,60 +1,80 @@
 # Benchmarks
 
-**Every number below was produced by actually running the benchmark binary
-named next to it, in this repository, on the machine described here.**
-Nothing is hard-coded, extrapolated silently, or backed out from a target.
-Where a number is a *projection* onto different hardware, it is labeled
-"projected" and shown with its assumptions, separately from anything
-measured.
+This document describes how CoreDB's performance measurements were collected, what each benchmark exercises, and the limitations of the current results.
+
+The results below were collected from the benchmark binaries in this repository on the machine described here. Each benchmark reports the workload, execution environment, and measured result needed to reproduce the run.
 
 ## Machine and toolchain
 
+```text
+Apple M1 Pro
+8 logical cores
+16 GiB memory
+macOS 26.6.2 (build 25G83)
+
+System compiler:
+Apple clang 21.0.0
+
+LLVM used by the JIT:
+Homebrew LLVM 17.0.6
+
+CMake:
+4.3.2
 ```
-$ sysctl -n machdep.cpu.brand_string        Apple M1 Pro
-$ sysctl -n hw.ncpu                          8 (logical cores; no SMT on this chip)
-$ sysctl -n hw.memsize                       17179869184  (16 GiB)
-$ sw_vers                                    macOS 26.6.2 (build 25G83)
-$ clang++ --version                          Apple clang 21.0.0 (system compiler, used for
-                                              the coredb library and non-JIT binaries)
-$ /opt/homebrew/opt/llvm@17/bin/clang --version   Homebrew clang 17.0.6 (LLVM 17.0.6, used by jit::QueryJit)
-$ cmake --version                            4.3.2
+
+Disk space available on the benchmark volume was approximately 127 GB.
+
+Architecture:
+
+```text
+arm64
 ```
 
-Disk: ~127 GB free on the volume used for benchmark scratch data. This is
-the hard constraint behind every dataset-size decision below — see
-"On the 200 GB / 88 GB/s / 500K txns/sec figures" at the end of this file.
+This machine supports ARM NEON but not AVX2 or AVX-512.
 
-Architecture: **arm64**. There is no AVX2/AVX-512 on this machine —
-those kernels are real, compiled, and covered by
-`tests/unit/test_simd_equivalence.cpp`'s equivalence checks on x86_64 CI
-runners, but they have never executed here and no performance number for
-them appears in this document. Every number below that says "NEON" or
-"scalar" is what actually ran.
+The AVX2 and AVX-512 implementations are compiled on supported x86-64 builds, while SIMD equivalence tests execute only the instruction-set tiers available on the host CPU. No AVX2 or AVX-512 performance numbers in this document were measured on the M1 Pro.
 
-Build: `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCOREDB_ENABLE_JIT=ON`,
-then `cmake --build build -j8`. All numbers below are from that Release
-build; correctness (equivalence, MVCC, WAL, recovery, concurrency) is
-additionally verified under AddressSanitizer+UndefinedBehaviorSanitizer and
-ThreadSanitizer (see "Sanitizer verification" below), which are Debug
-builds and not used for any timing number here.
+The Release build used for performance measurements was produced with:
 
-Every benchmark binary prints its detected CPU capabilities
-(`util::DescribeCapabilities`) as its first line of output, so a run's
-output is self-describing even out of context.
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOREDB_ENABLE_JIT=ON
+
+cmake --build build -j8
+```
+
+Every benchmark binary prints the detected CPU capabilities using:
+
+```text
+util::DescribeCapabilities
+```
+
+so benchmark output remains self-describing when copied outside the repository.
 
 ---
 
-## 1. Scan throughput — `bench_scan_throughput`
+## 1. Scan throughput
 
-Unconditional `SUM()` over a resident `int64_t` column (`simd::Sum`,
-dispatched to NEON on this machine), at sizes from 8 KiB (L1-resident) to
-2 GiB (far past this chip's caches).
+Benchmark:
 
-```
-$ ./build/benchmarks/bench_scan_throughput
+```text
+bench_scan_throughput
 ```
 
-| rows | bytes | time | throughput |
+Run with:
+
+```bash
+./build/benchmarks/bench_scan_throughput
+```
+
+This benchmark performs an unconditional `SUM()` over a resident `int64_t` column using `simd::Sum`.
+
+On this machine, runtime dispatch selects the NEON implementation.
+
+The workload ranges from 8 KiB to 2 GiB so the benchmark includes both cache-resident and memory-bandwidth-bound cases.
+
+| Rows | Data size | Time | Throughput |
 |---:|---:|---:|---:|
 | 1,024 | 8 KiB | 0.000 ms | 27.0 GiB/s |
 | 16,384 | 128 KiB | 0.005 ms | 23.8 GiB/s |
@@ -63,156 +83,336 @@ $ ./build/benchmarks/bench_scan_throughput
 | 4,194,304 | 32 MiB | 1.35 ms | 23.2 GiB/s |
 | 16,777,216 | 128 MiB | 5.38 ms | 23.2 GiB/s |
 | 67,108,864 | 512 MiB | 21.4 ms | 23.4 GiB/s |
-| 268,435,456 | 2 GiB | 90.0 ms | **22.2 GiB/s (≈ 23.9 GB/s)** |
+| 268,435,456 | 2 GiB | 90.0 ms | **22.2 GiB/s (~23.9 GB/s)** |
 
-**Reading this:** throughput is essentially flat from 128 KiB to 2 GiB —
-this is a single core, memory-bandwidth-bound scan, not a cache-residency
-artifact. 8 KiB is the outlier (L1-resident, ALU/loop-overhead bound, not
-comparable to the rest). This is single-threaded; it does not attempt to
-saturate the chip's full memory bandwidth (which requires many cores
-issuing traffic concurrently) — this kernel measures one core's achievable
-scan rate, which is the number `exec::RunVectorized` and the SIMD-tier
-comparison below actually depend on.
+### Interpretation
 
-## 2. Scalar vs. NEON vs. AVX2 vs. AVX-512 — `bench_simd_compare`
+Throughput remains close to 23 GiB/s from 128 KiB through 2 GiB.
 
-```
-$ ./build/benchmarks/bench_simd_compare
-```
+That stability suggests the larger runs are measuring sustained single-core scan throughput rather than benefiting primarily from cache residency.
 
-16.7M rows (128 MiB), all reported on this arm64 machine — scalar vs. NEON
-only; AVX2/AVX-512 rows are printed as `SkipWithError("... not available on
-this CPU")` by the same binary on an x86_64 host without those features,
-and are not reported here because they didn't run here:
+The 8 KiB result is different because the working set fits easily in L1 cache and loop overhead becomes a larger part of the measurement.
 
-| kernel | time | throughput |
-|---|---:|---:|
-| `Sum_Scalar` | 3.09 ms | 42.3 GiB/s |
-| `Sum_Neon` | 2.87 ms | **44.7 GiB/s (1.05x)** |
-| `FilterGtSum_Scalar` | 50.3 ms | 5.0 GiB/s |
-| `FilterGtSum_Neon` | 5.48 ms | **45.8 GiB/s (9.2x)** |
+This benchmark is single-threaded. It measures the throughput available to the current scan kernel on one core rather than the aggregate memory bandwidth of the full processor.
 
-**Reading this:** for a plain unconditional sum, scalar and NEON are close
-— Apple clang's auto-vectorizer already does well on the trivial reduction,
-and `Sum_Neon`'s advantage is modest (the kernel originally used one
-128-bit accumulator and *lost* to auto-vectorized scalar; splitting it into
-two independent accumulator chains — see `src/simd/kernels_neon.cpp` — is
-what got it back ahead. A single accumulator serializes on
-`acc = acc + next`; two chains let the CPU overlap the additions).
+---
 
-For the filtered sum, NEON's **9.2x** speedup is the real story, and it
-isn't really about SIMD width — it's branch misprediction. `pred[i] > 500`
-against uniform-random `[0, 1000)` data is right at 50% selectivity, the
-worst case for a branch predictor. `FilterGtSum_Scalar` branches per
-element; `FilterGtSum_Neon` computes a mask and does a branchless
-mask-and-add (`vandq_s64`/`vsubq_s64`) — no misprediction possible. This is
-the same technique the JIT loop was rewritten to use (§3).
+## 2. Scalar vs. NEON
 
-## 3. Volcano vs. vectorized vs. JIT — `bench_exec_compare`
+Benchmark:
 
-`SUM(agg) WHERE pred > 500` over 4,000,000 rows across 61 segments (65,536
-rows/segment), uniform-random predicate over `[0, 1000)` (~50% selectivity,
-so pruning cannot skip any segment — this measures per-row execution cost,
-not pruning).
-
-```
-$ ./build/benchmarks/bench_exec_compare
+```text
+bench_simd_compare
 ```
 
-| strategy | time | throughput | vs. Volcano |
+Run with:
+
+```bash
+./build/benchmarks/bench_simd_compare
+```
+
+The benchmark operates on 16.7 million rows, or approximately 128 MiB of `int64_t` data.
+
+Because the benchmark machine is ARM64, the measured comparison is between scalar and NEON implementations.
+
+| Kernel | Time | Throughput | Relative |
+|---|---:|---:|---:|
+| `Sum_Scalar` | 3.09 ms | 42.3 GiB/s | 1.00x |
+| `Sum_Neon` | 2.87 ms | 44.7 GiB/s | **1.05x** |
+| `FilterGtSum_Scalar` | 50.3 ms | 5.0 GiB/s | 1.00x |
+| `FilterGtSum_Neon` | 5.48 ms | 45.8 GiB/s | **9.2x** |
+
+### Unconditional sum
+
+The scalar and NEON unconditional-sum implementations are close.
+
+Apple Clang already auto-vectorizes the simple scalar reduction effectively, so the handwritten NEON version has only a modest advantage.
+
+The NEON implementation originally used one accumulator chain:
+
+```text
+acc = acc + next
+```
+
+That creates a dependency between consecutive vector additions.
+
+The final implementation uses two independent accumulators so the processor can overlap more work before the partial sums are combined.
+
+See:
+
+```text
+src/simd/kernels_neon.cpp
+```
+
+### Filtered sum
+
+The filtered workload shows a much larger difference.
+
+The predicate is approximately:
+
+```text
+pred[i] > 500
+```
+
+against uniformly distributed values in:
+
+```text
+[0, 1000)
+```
+
+This produces roughly 50% selectivity.
+
+The scalar implementation performs a conditional branch for each element. At approximately 50% selectivity, the branch outcome is difficult to predict consistently.
+
+The NEON implementation instead computes a comparison mask and uses branchless masked accumulation.
+
+The measured result was:
+
+```text
+9.2x faster than the scalar implementation
+```
+
+for this workload.
+
+The same branchless approach is also used by the LLVM JIT path.
+
+---
+
+## 3. Volcano vs. vectorized vs. LLVM JIT
+
+Benchmark:
+
+```text
+bench_exec_compare
+```
+
+Run with:
+
+```bash
+./build/benchmarks/bench_exec_compare
+```
+
+The benchmark evaluates:
+
+```sql
+SELECT SUM(agg)
+WHERE pred > 500;
+```
+
+over 4,000,000 rows distributed across 61 segments.
+
+Each segment contains approximately:
+
+```text
+65,536 rows
+```
+
+Predicate values are uniformly distributed over:
+
+```text
+[0, 1000)
+```
+
+so selectivity is approximately 50%.
+
+No segment can be pruned under this workload, which isolates per-row execution behavior rather than segment-pruning effectiveness.
+
+| Strategy | Time | Throughput | vs. Volcano |
 |---|---:|---:|---:|
 | `RunVolcano` | 33.7 ms | 119.6M rows/s | 1.0x |
-| `RunVectorized` (NEON) | 1.38 ms | 2.90G rows/s | 24.4x |
+| `RunVectorized` (NEON) | 1.38 ms | 2.90G rows/s | **24.4x** |
 | `RunJit` | 1.96 ms | 2.07G rows/s | **17.2x** |
 
-**Reading this — the single most interesting result in this project:** the
-JIT number above is *after* two changes made in response to the first
-measurement, not the first thing that was tried:
+### JIT optimization path
 
-1. **First version measured 33.3ms → 24.8ms (1.3x vs. Volcano).** The
-   generated IR was handed straight to LLJIT with no optimization pass at
-   all — no `mem2reg`, nothing. Running LLVM's real `-O3` pipeline
-   (`PassBuilder::buildPerModuleDefaultPipeline`) over the IR before
-   codegen brought it to 13.4ms (2.5x).
-2. **Still nowhere near the SIMD kernel.** The generated loop had a real
-   conditional branch (`if (pred[i] > threshold) { sum += ...; } `) — the
-   same shape `FilterGtSum_Scalar` above loses badly on. LLVM's
-   auto-vectorizer won't vectorize a branchy reduction like that. Rewriting
-   the generated IR to be **branchless** (`select` instead of a
-   conditional branch — see `src/jit/query_jit.cpp`, mirroring the exact
-   masking trick `FilterGtSum_Neon` uses) let the vectorizer recognize the
-   loop and emit NEON instructions automatically: 1.96ms, within 40% of the
-   hand-written kernel, using *generated* code.
+The JIT result changed substantially during implementation.
 
-This is a real engineering lesson, not a benchmark quirk: **an LLVM JIT
-only outperforms an interpreter if you actually run the optimizer on the
-IR you generate, and it only auto-vectorizes if the IR is shaped so the
-vectorizer can prove it's safe to do — writing a naive scalar loop and
-expecting LLVM to save you is not enough.** Both changes are still in the
-code (`src/jit/query_jit.cpp`), and `tests/unit/test_jit_equivalence.cpp`
-pins the compiled function's output against the scalar reference across
-sizes 0, 1, 2, 100, and 10007 rows, so neither optimization could have
-silently changed the result.
+The first version generated LLVM IR and handed it directly to LLJIT without running an optimization pipeline.
 
-## 4. MVCC insert/update throughput — `bench_mvcc_throughput`
+Measured result:
 
-Two workloads, each run at 1/2/4/8 worker threads for 1.5 real seconds:
-`insert` (every txn creates a new row, zero contention possible) and
-`update` (every txn updates one of 16 fixed keys — a deliberate
-high-contention hotspot; aborted conflicts are counted and reported, not
-hidden).
-
-```
-$ ./build/benchmarks/bench_mvcc_throughput
+```text
+33.3 ms → 24.8 ms
+1.3x vs. Volcano
 ```
 
-| workload | threads | committed | aborted | txns/sec |
-|---|---:|---:|---:|---:|
-| insert | 1 | 5,280,787 | 0 | **3,496,089** |
-| insert | 2 | 3,143,521 | 0 | 2,020,987 |
-| insert | 4 | 1,861,601 | 0 | 1,236,751 |
-| insert | 8 | 1,376,423 | 0 | 914,430 |
-| update | 1 | 4,244,208 | 0 | **2,819,948** |
-| update | 2 | 2,784,699 | 33,162 | 1,849,609 |
-| update | 4 | 1,464,286 | 67,106 | 975,206 |
-| update | 8 | 503,128 | 75,555 | 334,670 |
+The generated IR was then passed through LLVM's `-O3` pipeline using:
 
-**Reading this:** single-threaded throughput is high — **3.5M txns/sec**
-insert, **2.8M txns/sec** update — and *drops* as thread count increases in
-both workloads. This is the clearest, most concrete finding in this
-project: `mvcc::TransactionManager::Begin()` and `::Commit()` both take one
-process-wide `std::mutex` (see `include/coredb/mvcc/transaction.h`).
-Every transaction, regardless of what row it touches, serializes on that
-one lock twice. More threads means more contention on that lock and more
-context-switch overhead, not more parallelism. See DESIGN_DECISIONS.md for
-what a fix would look like (a lock-free or sharded timestamp allocator);
-it was not attempted here because verifying a lock-free MVCC timestamp
-scheme's correctness under the remaining time budget for this project was
-judged riskier than reporting the bottleneck honestly. Note this same root
-cause reappears independently in §6 (recovery).
-
-The `insert` workload runs with **no** background compactor —
-`Table::Insert` never scans the delta layer, so compacting it is pure
-overhead (confirmed by measurement: running a compactor alongside this
-workload measured ~700K txns/sec single-threaded, roughly 5x worse than
-without one). The `update` workload **does** run
-`compaction::BackgroundCompactor` (threshold 2000 rows, 5ms poll) — without
-it, `Update`'s linear delta scan (no row_id index; see
-DESIGN_DECISIONS.md) makes every subsequent update on the same 16-key
-hotspot scan an ever-growing vector, and measured throughput visibly
-collapsed over the run instead of reaching a steady state. Both policy
-choices, and why they differ, are in `benchmarks/bench_mvcc_throughput.cpp`.
-
-## 5. Compaction — `bench_compaction`
-
-Repeated rounds of (insert a batch, delete ~10% of everything inserted so
-far, compact), at three batch sizes, 5 rounds each:
-
-```
-$ ./build/benchmarks/bench_compaction
+```text
+PassBuilder::buildPerModuleDefaultPipeline
 ```
 
-| batch size | round | delta before | base rows after | duration | rows/sec |
+That reduced execution time to:
+
+```text
+13.4 ms
+2.5x vs. Volcano
+```
+
+The generated loop still contained a conditional branch:
+
+```text
+if (pred[i] > threshold) {
+    sum += value[i];
+}
+```
+
+The loop was then rewritten to use branchless LLVM `select` operations.
+
+Conceptually:
+
+```text
+selected = pred[i] > threshold ? value[i] : 0
+sum += selected
+```
+
+This representation allowed LLVM's optimizer and loop vectorizer to emit SIMD instructions for the generated code.
+
+The final measured result was:
+
+```text
+1.96 ms
+17.2x vs. Volcano
+```
+
+The result shows that JIT performance depends heavily on both optimization passes and the structure of generated IR. Generating native code alone does not guarantee efficient execution.
+
+Correctness is verified by:
+
+```text
+tests/unit/test_jit_equivalence.cpp
+```
+
+which compares JIT output against the scalar reference across multiple input sizes.
+
+---
+
+## 4. MVCC insert and update throughput
+
+Benchmark:
+
+```text
+bench_mvcc_throughput
+```
+
+Run with:
+
+```bash
+./build/benchmarks/bench_mvcc_throughput
+```
+
+Two workloads are measured for 1.5 seconds each across 1, 2, 4, and 8 worker threads.
+
+### Insert workload
+
+Each transaction creates a new row.
+
+There is no logical row contention between workers.
+
+| Threads | Committed | Aborted | Txns/sec |
+|---:|---:|---:|---:|
+| 1 | 5,280,787 | 0 | **3,496,089** |
+| 2 | 3,143,521 | 0 | 2,020,987 |
+| 4 | 1,861,601 | 0 | 1,236,751 |
+| 8 | 1,376,423 | 0 | 914,430 |
+
+The peak measured result was approximately:
+
+```text
+3.5M single-threaded MVCC inserts/sec
+```
+
+### Update workload
+
+Each transaction updates one of 16 fixed keys.
+
+This intentionally creates a high-contention workload.
+
+| Threads | Committed | Aborted | Txns/sec |
+|---:|---:|---:|---:|
+| 1 | 4,244,208 | 0 | **2,819,948** |
+| 2 | 2,784,699 | 33,162 | 1,849,609 |
+| 4 | 1,464,286 | 67,106 | 975,206 |
+| 8 | 503,128 | 75,555 | 334,670 |
+
+The peak measured result was approximately:
+
+```text
+2.8M single-threaded MVCC updates/sec
+```
+
+### Thread scaling
+
+Throughput decreases as the thread count rises in both workloads.
+
+The insert workload has no row-level contention, so its negative scaling points to contention in shared transaction-management state rather than contention over individual records.
+
+`mvcc::TransactionManager::Begin()` and `TransactionManager::Commit()` both acquire one process-wide `std::mutex`.
+
+Every transaction therefore serializes through that shared lock twice regardless of which row it accesses.
+
+Additional worker threads increase lock contention and scheduling overhead rather than increasing throughput.
+
+See:
+
+```text
+include/coredb/mvcc/transaction.h
+```
+
+and [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md).
+
+A sharded or lock-free timestamp-allocation design is left as future work because changing the timestamp mechanism also requires additional concurrency and correctness validation.
+
+### Compaction policy during the benchmark
+
+The insert workload does not run the background compactor.
+
+`Table::Insert` appends a new delta record and does not search for an existing row version, so compaction adds unnecessary work to this specific workload.
+
+The update workload does run:
+
+```text
+compaction::BackgroundCompactor
+```
+
+with:
+
+```text
+threshold = 2000 rows
+poll interval = 5 ms
+```
+
+`Update` currently performs a linear scan of the delta layer when locating the relevant row version.
+
+Without compaction, the delta vector grows continuously and update latency increases throughout the run.
+
+The benchmark uses background compaction so the update workload reaches a more stable operating regime.
+
+---
+
+## 5. Compaction
+
+Benchmark:
+
+```text
+bench_compaction
+```
+
+Run with:
+
+```bash
+./build/benchmarks/bench_compaction
+```
+
+The benchmark repeatedly:
+
+1. inserts a batch
+2. deletes approximately 10% of the accumulated rows
+3. runs `Table::Compact()`
+
+Each batch size is tested for five rounds.
+
+| Batch size | Round | Delta before | Base rows after | Duration | Rows/sec |
 |---:|---:|---:|---:|---:|---:|
 | 1,000 | 0 | 1,000 | 900 | 0.69 ms | 1,447,266 |
 | 1,000 | 4 | 1,302 | 3,687 | 1.18 ms | 1,107,221 |
@@ -221,29 +421,80 @@ $ ./build/benchmarks/bench_compaction
 | 50,000 | 0 | 50,000 | 45,000 | 12.6 ms | 3,960,331 |
 | 50,000 | 4 | 65,511 | 184,280 | **34.2 ms** | 1,917,774 |
 
-**Reading this:** compaction duration climbs with base size within a batch
-size (round 0 → round 4), exactly as the architecture predicts —
-`Table::Compact()` rewrites the *entire* base segment every cycle (see
-ARCHITECTURE.md/DESIGN_DECISIONS.md), so cost is O(total base rows), not
-O(delta size). At 50,000-row batches, base grows from 45K to 184K rows
-over 5 rounds and per-round compaction time nearly triples. This is the
-expected, documented cost of the "full rewrite, not leveled" design choice
-— not a bug.
+### Interpretation
 
-## 6. Recovery scalability — `bench_recovery`
+Compaction time increases as the base grows.
 
-`bench_recovery --size-mb=N` generates a WAL of the requested size (rows
-are a single fixed-length string column; row count is derived by checking
-actual file size, not estimated), then replays it from scratch at
-1/2/4/8/16/32 worker threads, each a fresh `Table`, no checkpoint.
+This matches the implementation because:
 
-### 8 MB (30,000 rows) — quick/CI-sized run
-
-```
-$ ./build/benchmarks/bench_recovery --size-mb=8
+```text
+Table::Compact()
 ```
 
-| workers | time | MB/s | rows/s | speedup |
+rewrites the complete base representation rather than performing incremental or leveled compaction.
+
+The cost therefore scales approximately with:
+
+```text
+total base rows
+```
+
+rather than only with the current delta size.
+
+For the 50,000-row batch workload, the base grows from approximately 45,000 rows to 184,000 rows over five rounds, while measured compaction time rises from 12.6 ms to 34.2 ms.
+
+This is an expected consequence of the current full-rewrite design.
+
+---
+
+## 6. Recovery scalability
+
+Benchmark:
+
+```text
+bench_recovery
+```
+
+Usage:
+
+```bash
+./build/benchmarks/bench_recovery --size-mb=N
+```
+
+The benchmark generates a WAL of approximately the requested size, then replays it into a fresh table using:
+
+```text
+1
+2
+4
+8
+16
+32
+```
+
+configured worker threads.
+
+Rows contain one fixed-length string column.
+
+The benchmark determines the row count from the actual WAL file size rather than relying on an estimated number of bytes per row.
+
+No checkpoint is used for these runs.
+
+### 8 MB run
+
+Run with:
+
+```bash
+./build/benchmarks/bench_recovery --size-mb=8
+```
+
+Approximately:
+
+```text
+30,000 rows
+```
+
+| Workers | Time | MB/s | Rows/s | Speedup |
 |---:|---:|---:|---:|---:|
 | 1 | 49.2 ms | 173.3 | 609,877 | 1.00x |
 | 2 | 48.7 ms | 174.9 | 615,521 | 1.01x |
@@ -252,13 +503,21 @@ $ ./build/benchmarks/bench_recovery --size-mb=8
 | 16 | 91.9 ms | 92.8 | 326,356 | 0.54x |
 | 32 | 114.4 ms | 74.5 | 262,132 | 0.43x |
 
-### 512 MB (1,802,000 rows)
+### 512 MB run
 
-```
-$ ./build/benchmarks/bench_recovery --size-mb=512
+Run with:
+
+```bash
+./build/benchmarks/bench_recovery --size-mb=512
 ```
 
-| workers | time | MB/s | rows/s | speedup |
+Approximately:
+
+```text
+1,802,000 rows
+```
+
+| Workers | Time | MB/s | Rows/s | Speedup |
 |---:|---:|---:|---:|---:|
 | 1 | 3.93 s | 130.3 | 458,467 | 1.00x |
 | 2 | 3.73 s | 137.1 | 482,491 | **1.05x** |
@@ -267,90 +526,177 @@ $ ./build/benchmarks/bench_recovery --size-mb=512
 | 16 | 7.08 s | 72.4 | 254,660 | 0.56x |
 | 32 | 8.37 s | 61.2 | 215,267 | 0.47x |
 
-Checksum verification (`Segment::VerifyIntegrity`, run after every replay)
-passed on every configuration in both runs: `checksum_ok=yes`.
+Checksum verification completed successfully after every replay:
 
-**Reading this — more parallel workers makes recovery slower, not
-faster, at every size tested.** The row_id-sharded partitioning itself is
-correct (see DESIGN_DECISIONS.md for why), but each replayed operation
-still goes through `Table::Begin()`/`Commit()`, which serialize on
-`TransactionManager`'s single mutex — **the exact same bottleneck §4 found
-independently.** Sharding the *data* correctly doesn't help when the
-*apply path* has a global lock regardless of which shard called it. Two
-workers occasionally edges out one (thread-count noise, not real
-parallelism — 1.01x and 1.05x are within run-to-run variance); 4 and above
-are consistently worse. This is reported as measured, not smoothed over;
-DESIGN_DECISIONS.md names the fix (a bulk-apply path for recovery that
-bypasses per-op transaction bookkeeping, which is safe during recovery
-specifically because there are no concurrent readers yet).
+```text
+checksum_ok=yes
+```
+
+### Interpretation
+
+Additional recovery workers do not improve throughput on the current implementation.
+
+The best 512 MB result was:
+
+```text
+2 workers
+137.1 MB/s
+1.05x relative to one worker
+```
+
+That small difference is close enough to single-worker performance that it should not be interpreted as meaningful scaling.
+
+Performance decreases consistently at four or more workers.
+
+The data partitioning itself is performed by:
+
+```text
+row_id % num_workers
+```
+
+but each replayed operation still calls:
+
+```text
+Table::Begin()
+Table::Commit()
+```
+
+Those operations serialize through the same global transaction-manager mutex observed in the MVCC throughput benchmark.
+
+The benchmark therefore identifies the same synchronization bottleneck through two separate workloads:
+
+- normal transactional execution
+- recovery replay
+
+A recovery-specific bulk-apply path could avoid per-operation transaction bookkeeping because recovery runs before concurrent readers are admitted.
+
+That optimization is not part of the current implementation.
+
+---
 
 ## Sanitizer verification
 
-Not a performance benchmark, but part of what makes the numbers above
-trustworthy: the full test suite (all 79 test cases,
-`COREDB_ENABLE_JIT=OFF` where noted) passes clean under:
+The project was additionally validated with sanitizer-specific test configurations.
 
-- **AddressSanitizer + UndefinedBehaviorSanitizer** (`-fsanitize=address,undefined`,
-  Debug build): 72/72 tests pass (JIT tests excluded from this configuration).
-  One real bug was found and fixed this way — see DESIGN_DECISIONS.md,
-  "Hardening found by fuzzing the length header in a test."
-- **ThreadSanitizer** (`-fsanitize=thread`, Debug build): all
-  concurrency/MVCC/compaction/table-CRUD tests (20 cases) pass with zero
-  reported data races.
+These runs are correctness checks rather than performance measurements, and their timings are not used anywhere in the benchmark results above.
 
-Both are wired into CI (`.github/workflows/ci.yml`, `sanitizers` job) and
-were run locally on this machine before being trusted in CI.
+### AddressSanitizer + UndefinedBehaviorSanitizer
 
-## On the 200 GB / 88 GB/s / 500K txns/sec / 32-REDO-thread figures
+Configuration:
 
-This machine cannot produce those numbers, for reasons that are physical,
-not implementation quality:
+```text
+-fsanitize=address,undefined
+Debug build
+COREDB_ENABLE_JIT=OFF
+```
 
-- **200 GB recovery workload:** this machine has ~127 GB free disk and
-  16 GB RAM. A 200 GB WAL does not fit. `bench_recovery`'s `--size-mb` flag
-  is exactly how you'd run that test on hardware where it does fit — the
-  recovery code path itself does not change with dataset size (see
-  `RecoveryConfig`/`RecoveryManager`).
-- **88 GB/s scan throughput:** measured single-core throughput here is
-  ~23 GB/s (§1). This machine's *aggregate* memory bandwidth (many cores
-  issuing traffic concurrently, LPDDR5) is higher than that, but CoreDB's
-  scan path is currently single-threaded per segment — reaching 88 GB/s
-  would need both a multi-core parallel scan (not yet implemented — see
-  "Future work" below) *and* server-class memory bandwidth well beyond a
-  laptop's, most plausibly demonstrated on an x86_64 host with AVX-512 and
-  many memory channels.
-- **32 REDO threads:** this machine has 8 logical cores. §6 shows 16/32
-  configured workers running as oversubscribed threads on 8 cores, which
-  is a real, valid thing to measure (and did), but "32 REDO threads"
-  as a *scaling* claim needs a machine with enough cores for that number to
-  mean something, which this one doesn't have.
-- **500K txns/sec MVCC-delta:** measured single-threaded throughput
-  (§4) is **3.5M txns/sec insert / 2.8M txns/sec update — both already
-  above 500K** without needing a bigger machine. What does *not* hold up
-  at any thread count on this hardware is *multi-threaded scaling* past
-  that number; see §4's discussion of the `TransactionManager` mutex.
+Result:
 
-**What would be needed to responsibly attempt the full-scale figures:** an
-x86_64 host with AVX-512, many cores (32+ for the REDO-thread claim to be
-meaningful), high memory bandwidth (multi-channel DDR5 or similar), and
-enough NVMe storage for a 200 GB WAL plus checkpoint segments —
-run this exact benchmark suite there. No code changes would be needed
-for the recovery or SIMD-tier benchmarks (`--size-mb` and runtime CPU
-detection already parameterize both); the MVCC throughput ceiling would
-still need the `TransactionManager` mutex contention fix described in
-DESIGN_DECISIONS.md before multi-threaded numbers would scale, regardless
-of hardware.
+```text
+72 / 72 tests passed
+```
 
-## Future work (identified by these benchmarks, not attempted here)
+The JIT-specific tests are excluded from this sanitizer configuration.
 
-1. Replace `TransactionManager`'s global mutex with a lock-free or sharded
-   timestamp allocator — the single highest-leverage change, since it's
-   the root cause behind both §4's negative thread scaling and §6's.
-2. A bulk-apply path for `RecoveryManager` that skips per-operation
-   `Begin`/`Commit` bookkeeping (safe specifically during recovery, where
-   there are no concurrent readers).
-3. A row_id index (hash or B-tree, MVCC-aware) to remove `Update`/`Delete`'s
-   linear delta scan.
-4. Incremental/leveled compaction, to avoid full-base-rewrite cost (§5).
-5. A multi-core parallel scan path, needed before an 88 GB/s-class scan
-   number would be meaningful on any hardware.
+This run exposed a real robustness issue in the WAL reader: a corrupted record-length header could request a very large allocation before the truncation check executed.
+
+The reader was changed to validate record lengths before allocating based on the declared size.
+
+See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md).
+
+### ThreadSanitizer
+
+Configuration:
+
+```text
+-fsanitize=thread
+Debug build
+```
+
+Concurrency-relevant tests executed:
+
+```text
+20 / 20 passed
+```
+
+ThreadSanitizer reported no data races in the tested concurrency, MVCC, compaction, and table operations.
+
+Both sanitizer configurations are represented in:
+
+```text
+.github/workflows/ci.yml
+```
+
+## Benchmark limitations
+
+These measurements were collected on one Apple M1 Pro laptop.
+
+They should therefore be read as measurements of this implementation on this hardware, not as universal performance characteristics.
+
+Important limitations include:
+
+- scan benchmarks are single-threaded
+- the machine has 8 logical cores
+- ARM64 measurements use NEON rather than AVX2 or AVX-512
+- recovery benchmarks are bounded by the available local disk capacity
+- the current transaction manager contains a global mutex
+- the current compaction strategy rewrites the full base
+- the delta layer does not contain a row-id index
+- execution benchmarks use one fixed query shape
+- benchmark data is synthetic
+
+The benchmark binaries are parameterized where practical so the same implementation can be tested on different hardware without changing the storage or execution code.
+
+## Future work
+
+### 1. Reduce transaction-manager contention
+
+The highest-impact concurrency limitation is the process-wide mutex used by the transaction manager.
+
+A future implementation could investigate:
+
+- atomic timestamp allocation
+- sharded transaction state
+- reduced critical sections
+- lock-free snapshot tracking
+
+Any replacement would require concurrency testing to preserve the current snapshot-isolation guarantees.
+
+### 2. Add recovery-specific bulk apply
+
+Recovery currently routes each operation through normal transaction bookkeeping.
+
+Because recovery happens before concurrent readers are admitted, a dedicated bulk-apply path could reconstruct committed state without acquiring the transaction-manager mutex for every individual operation.
+
+### 3. Add a row-id index
+
+`Update` and `Delete` currently locate row versions through a linear delta scan.
+
+A hash index or tree keyed by `row_id` could reduce lookup cost as the delta grows.
+
+The index would need to remain consistent with MVCC visibility and compaction.
+
+### 4. Incremental or leveled compaction
+
+The current full-rewrite strategy has cost proportional to the entire base.
+
+A future implementation could use incremental or leveled compaction to reduce write amplification and avoid rebuilding all base rows every cycle.
+
+### 5. Multi-core scans
+
+The current scan benchmark uses one execution thread.
+
+Partitioning segments across worker threads would allow CoreDB to measure aggregate scan throughput and determine where the system begins to saturate the machine's memory subsystem.
+
+### 6. Benchmark on additional architectures
+
+The project already contains separate:
+
+- scalar
+- NEON
+- AVX2
+- AVX-512
+
+execution paths.
+
+Running the same benchmark suite on x86-64 systems with AVX2 and AVX-512 support would allow direct comparison of those implementations under real hardware rather than relying only on compilation and correctness checks.
