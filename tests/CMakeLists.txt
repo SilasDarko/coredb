@@ -25,3 +25,9 @@ target_include_directories(coredb_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 include(GoogleTest)
 gtest_discover_tests(coredb_tests)
+
+# LLVM ORC's in-process JIT resolves target-process wrapper symbols from
+# the host executable on ELF platforms.
+if(COREDB_ENABLE_JIT AND UNIX AND NOT APPLE)
+  set_target_properties(coredb_tests PROPERTIES ENABLE_EXPORTS ON)
+endif()

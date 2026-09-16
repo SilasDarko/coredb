@@ -44,7 +44,7 @@ if(COREDB_ENABLE_JIT)
   target_include_directories(coredb PUBLIC ${LLVM_INCLUDE_DIRS})
   separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
   target_compile_definitions(coredb PUBLIC ${LLVM_DEFINITIONS_LIST} COREDB_ENABLE_JIT=1)
-  llvm_map_components_to_libnames(LLVM_LIBS core orcjit native irreader)
+  llvm_map_components_to_libnames(LLVM_LIBS core orcjit orctargetprocess native irreader)
   target_link_libraries(coredb PUBLIC ${LLVM_LIBS})
 endif()
 

@@ -20,3 +20,9 @@ coredb_add_gbenchmark(bench_exec_compare)
 coredb_add_cli_benchmark(bench_mvcc_throughput)
 coredb_add_cli_benchmark(bench_compaction)
 coredb_add_cli_benchmark(bench_recovery)
+
+# bench_exec_compare exercises LLVM ORC JIT and must expose the host
+# process symbols required by LLJIT on ELF platforms.
+if(COREDB_ENABLE_JIT AND UNIX AND NOT APPLE)
+  set_target_properties(bench_exec_compare PROPERTIES ENABLE_EXPORTS ON)
+endif()
