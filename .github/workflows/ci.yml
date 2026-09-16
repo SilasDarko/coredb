@@ -10,25 +10,33 @@ jobs:
   build-and-test:
     name: Build & test (${{ matrix.build_type }})
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install LLVM 17, GoogleTest, Google Benchmark
+      - name: Install LLVM 17, GoogleTest, and Google Benchmark
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 17
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev libbenchmark-dev ninja-build
+          sudo apt-get install -y \
+            libgtest-dev \
+            libbenchmark-dev \
+            ninja-build
 
-      - name: Report CPU capabilities (informational)
+      - name: Report CPU capabilities
         run: |
+          echo "Architecture: $(uname -m)"
           echo "CPU: $(grep -m1 'model name' /proc/cpuinfo || true)"
-          echo "Flags of interest:"
-          grep -m1 -o -E 'avx2|avx512f' /proc/cpuinfo || echo "  (no avx2/avx512f on this runner)"
+          echo "Logical CPUs: $(nproc)"
+          echo "SIMD flags:"
+          grep -m1 -o -E 'avx2|avx512f' /proc/cpuinfo || \
+            echo "No AVX2/AVX-512 flags reported"
 
       - name: Configure
         run: |
@@ -46,7 +54,7 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --timeout 120
 
-      - name: Smoke-test benchmark binaries (short run, not a perf report)
+      - name: Smoke-test benchmark binaries
         working-directory: build
         run: |
           ./benchmarks/bench_scan_throughput --benchmark_min_time=0.01s
@@ -57,42 +65,56 @@ jobs:
           ./benchmarks/bench_recovery --size-mb=4
 
   sanitizers:
-    name: TSan + ASan/UBSan
+    name: Sanitizers
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install LLVM 17, GoogleTest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 17 and GoogleTest
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 17
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev ninja-build
+          sudo apt-get install -y \
+            libgtest-dev \
+            ninja-build
 
-      - name: Configure + build (ASan/UBSan)
+      - name: Configure ASan/UBSan
         run: |
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_PREFIX_PATH=/usr/lib/llvm-17 \
             -DCOREDB_ENABLE_JIT=OFF \
+            -DCOREDB_BUILD_TESTS=ON \
             -DCOREDB_BUILD_BENCHMARKS=OFF \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          cmake --build build-asan -j"$(nproc)"
+
+      - name: Build ASan/UBSan
+        run: cmake --build build-asan -j"$(nproc)"
 
       - name: Run tests under ASan/UBSan
         working-directory: build-asan
+        env:
+          ASAN_OPTIONS: detect_container_overflow=0
+          UBSAN_OPTIONS: print_stacktrace=1
         run: ctest --output-on-failure --timeout 180
 
-      - name: Configure + build (TSan)
+      - name: Configure TSan
         run: |
           cmake -S . -B build-tsan -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_PREFIX_PATH=/usr/lib/llvm-17 \
             -DCOREDB_ENABLE_JIT=OFF \
+            -DCOREDB_BUILD_TESTS=ON \
             -DCOREDB_BUILD_BENCHMARKS=OFF \
-            -DCMAKE_CXX_FLAGS="-fsanitize=thread"
-          cmake --build build-tsan -j"$(nproc)"
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
 
-      - name: Run concurrency + MVCC tests under TSan
+      - name: Build TSan
+        run: cmake --build build-tsan -j"$(nproc)"
+
+      - name: Run concurrency tests under TSan
         working-directory: build-tsan
         run: |
-          ./tests/coredb_tests --gtest_filter="*Concurren*:*Abort*:*Mvcc*:*Compaction*"
+          ./tests/coredb_tests \
+            --gtest_filter="*Concurren*:*Abort*:*Mvcc*:*Compaction*"
