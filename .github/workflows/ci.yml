@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & test (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 17, GoogleTest, Google Benchmark
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 17
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev libbenchmark-dev ninja-build
+
+      - name: Report CPU capabilities (informational)
+        run: |
+          echo "CPU: $(grep -m1 'model name' /proc/cpuinfo || true)"
+          echo "Flags of interest:"
+          grep -m1 -o -E 'avx2|avx512f' /proc/cpuinfo || echo "  (no avx2/avx512f on this runner)"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_PREFIX_PATH=/usr/lib/llvm-17 \
+            -DCOREDB_ENABLE_JIT=ON \
+            -DCOREDB_BUILD_TESTS=ON \
+            -DCOREDB_BUILD_BENCHMARKS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --timeout 120
+
+      - name: Smoke-test benchmark binaries (short run, not a perf report)
+        working-directory: build
+        run: |
+          ./benchmarks/bench_scan_throughput --benchmark_min_time=0.01s
+          ./benchmarks/bench_simd_compare --benchmark_min_time=0.01s
+          ./benchmarks/bench_exec_compare --benchmark_min_time=0.01s
+          ./benchmarks/bench_mvcc_throughput
+          ./benchmarks/bench_compaction
+          ./benchmarks/bench_recovery --size-mb=4
+
+  sanitizers:
+    name: TSan + ASan/UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 17, GoogleTest
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 17
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev ninja-build
+
+      - name: Configure + build (ASan/UBSan)
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_PREFIX_PATH=/usr/lib/llvm-17 \
+            -DCOREDB_ENABLE_JIT=OFF \
+            -DCOREDB_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build build-asan -j"$(nproc)"
+
+      - name: Run tests under ASan/UBSan
+        working-directory: build-asan
+        run: ctest --output-on-failure --timeout 180
+
+      - name: Configure + build (TSan)
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_PREFIX_PATH=/usr/lib/llvm-17 \
+            -DCOREDB_ENABLE_JIT=OFF \
+            -DCOREDB_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+          cmake --build build-tsan -j"$(nproc)"
+
+      - name: Run concurrency + MVCC tests under TSan
+        working-directory: build-tsan
+        run: |
+          ./tests/coredb_tests --gtest_filter="*Concurren*:*Abort*:*Mvcc*:*Compaction*"
