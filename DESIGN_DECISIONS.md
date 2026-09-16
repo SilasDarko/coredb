@@ -1,197 +1,696 @@
 # Design Decisions
 
-This file is the "why", not the "what" — ARCHITECTURE.md covers structure.
-Each entry names a trade-off CoreDB made deliberately, the alternative it
-gave up, and why that was the right call *at this project's scope*. Several
-of these were only discovered by writing benchmarks and sanitizer-checking
-the result, not planned up front — the entry says so where that's the case.
+This document explains the major tradeoffs behind CoreDB's implementation.
 
-## MVCC: a single shared counter for txn_id and commit_ts
+[ARCHITECTURE.md](ARCHITECTURE.md) describes how the system is structured. This file focuses on why particular storage, MVCC, recovery, and execution choices were made, along with the limitations those choices introduce.
 
-**Decision:** `TransactionManager` hands out both transaction ids (at
-`Begin`) and commit timestamps (at `Commit`) from the same monotonic
-`uint64_t` counter, under one mutex.
+## MVCC uses one shared counter for transaction IDs and commit timestamps
 
-**Alternative given up:** Real engines (Postgres, etc.) separate XID
-allocation from commit ordering and handle XID wraparound, because a
-32-bit XID space wraps on a busy server. CoreDB's `uint64_t` counter won't
-realistically wrap in this project's lifetime, so that whole subsystem
-(vacuum-driven wraparound prevention) doesn't need to exist.
+### Decision
 
-**Cost measured, not assumed:** `bench_mvcc_throughput` shows both
-`Begin()` and `Commit()` serializing on this one mutex — insert throughput
-*drops* as thread count rises (single-thread beats 8-thread). This is the
-most concrete, measured limitation in the whole project: a lock-free or
-sharded timestamp oracle would fix it, and it's the first thing worth doing
-if this became a real system. See BENCHMARKS.md.
+`TransactionManager` assigns both:
 
-## Write-write conflicts abort; they never block or queue
+- transaction IDs during `Begin()`
+- commit timestamps during `Commit()`
 
-**Decision:** `DeltaLayer::ClaimOrInsertBaseTombstone` runs entirely under
-one lock; if a different, still-active transaction already holds a claim on
-`row_id`, the caller gets `kConflict` and must abort. There is no waiting,
-no deadlock detection, no lock manager.
+from one monotonic `uint64_t` counter protected by a process-wide mutex.
 
-**Why:** A lock manager (wait-for graphs, deadlock detection, timeouts) is
-a project in itself. Immediate-abort is strictly simpler, is what several
-real optimistic-concurrency-control systems do under contention, and is
-fully correct — it just means CoreDB pushes retry logic to the caller
-instead of doing it internally. `tests/concurrency/test_aborts.cpp` covers
-exactly this (`RacingUpdatesToSameRowExactlyOneWins`).
+### Why
 
-## No row_id index — Update/Delete are O(rows)
+Using one ordering source keeps snapshot visibility simple.
 
-**Decision:** Finding whether a given `row_id` exists in the base layer
-(`Table::RowIdExistsInBase`) is a linear scan across every base segment's
-row_id column. `DeltaLayer`'s claim scan is a linear walk of the whole
-delta vector.
+A transaction records:
 
-**Why it's still here:** A B-tree or hash index over row_id is the obvious
-next thing to build, but it interacts with MVCC (an index entry needs
-transaction-aware visibility too, or it becomes another race), and getting
-that right is real complexity. At this project's data scale, `O(rows)` is
-honest and correct; the cost is visible and explained, not hidden.
+```text
+snapshot_ts = last_commit_ts
+```
 
-**How it actually bit us:** the first version of `bench_mvcc_throughput`
-ran its update-hotspot workload with *no* compactor. Delta grew unboundedly
-for 1.5 seconds of pure updates, and because every `Update()` re-scans the
-whole delta vector for `row_id`, per-op cost grew with total ops issued —
-throughput visibly collapsed over the run (not a clean steady-state
-number). The fix wasn't indexing row_id (out of scope) — it was running
-`compaction::BackgroundCompactor` alongside the writers, which is how the
-system is meant to be operated. See BENCHMARKS.md for the before/after.
+when it begins.
 
-## Compaction does a full rewrite every cycle
+A committed version is visible when its commit timestamp is at or before the reader's snapshot.
 
-**Decision:** `Table::Compact()` rebuilds *one* consolidated base segment
-from (existing base rows minus stably-deleted ones) plus (newly-stable
-delta rows), every time it runs. It never does incremental/leveled merges
-and never splits the base into multiple segments by size.
+This avoids needing a more complex transaction-ordering structure.
 
-**Alternative given up:** A real LSM engine merges in levels (L0, L1, L2,
-...) specifically so a compaction cycle never has to touch data that's
-already settled. CoreDB's approach is O(total base rows) per compaction.
+### Tradeoff
 
-**Why:** it's dramatically simpler to implement, verify, and explain, and
-it composes correctly with active-snapshot protection without needing
-epoch-based reclamation. `bench_compaction` shows the cost this trade-off
-has: compaction duration grows with base size as rounds accumulate. It also
-explains why `bench_mvcc_throughput`'s *insert* workload deliberately runs
-*without* a background compactor — inserts never need it (Insert doesn't
-scan delta), and running a full-rewrite compactor against a purely-growing,
-never-shrinking base is pure overhead. Discovering that (compacting made
-the insert benchmark *slower*) is what led to splitting the two workloads'
-compaction policy in the benchmark.
+The shared mutex creates a global synchronization point.
 
-## Checkpoints assume a quiescent point
+`bench_mvcc_throughput` shows that throughput decreases as additional worker threads are added, even for the insert workload where rows themselves do not contend.
 
-**Decision:** `recovery::WriteCheckpoint` calls `Table::Compact()` then
-saves whatever base segments result, recording the WAL's current LSN as
-`last_lsn`. This is only correct if no transaction is mid-flight when the
-checkpoint runs — an in-progress transaction's already-logged operations
-would sit at an LSN below `last_lsn` but not be reflected in the saved
-segments (compaction only promotes *stable* rows), and recovery skips
-everything at or below `last_lsn`.
+The same synchronization bottleneck also appears during parallel recovery.
 
-**Alternative given up:** ARIES-style fuzzy checkpoints, which can be taken
-concurrently with an active workload.
+A future implementation could explore:
 
-**Why:** correctly implementing a fuzzy checkpoint needs recovery to
-understand "this row might be stale as of the checkpoint, re-verify against
-the WAL tail," which is real complexity for a project at this scope.
-Quiescent-point checkpoints are simple and fully correct under that one
-assumption, which every test and benchmark here honors.
+- atomic timestamp allocation
+- sharded transaction state
+- reduced critical sections
+- lock-free snapshot tracking
 
-## REDO replay doesn't preserve original transaction boundaries
+Any replacement would need to preserve the current snapshot-isolation semantics under concurrency.
 
-**Decision:** `RecoveryManager` replays each surviving WAL operation as its
-own single-operation transaction (`Begin` → one op → `Commit`), rather than
-grouping operations back into their original transaction.
+See [BENCHMARKS.md](BENCHMARKS.md).
 
-**Why this is still correct:** durability only requires that a committed
-transaction's *effects* survive a crash, not that recovery re-enacts the
-exact same transaction shape. Only operations belonging to transactions
-that have a `COMMIT` record in the log are replayed at all — an aborted or
-crashed-mid-transaction transaction's operations are dropped in their
-entirety (implicit UNDO by omission), so there's no scenario where a
-partially-replayed original transaction leaks through. What's lost is
-fidelity of `txn_id`/`commit_ts` values post-recovery, which nothing in
-this system's contract promises to preserve.
+---
 
-**Why this is what makes replay parallelizable:** collapsing each op to its
-own transaction is exactly what makes row_id-sharded parallel replay valid
-— see the next entry.
+## Write-write conflicts abort instead of blocking
 
-## Parallel REDO is sharded by `row_id`, not by anything else
+### Decision
 
-**Decision:** `RecoveryManager` buckets surviving operations by
-`row_id % num_workers`; each worker thread replays its bucket sequentially,
-in original LSN order.
+`DeltaLayer::ClaimOrInsertBaseTombstone` performs row claiming while holding one lock.
 
-**Why this is safe:** the only correctness constraint on replay order is
-"a row's operations must apply in the order they were logged" (an insert
-before its own update, etc.) — operations on *different* row_ids have no
-ordering dependency in this table's model. Sharding by row_id preserves
-per-row order (a row's ops all land in the same bucket, appended in scan
-order) while letting unrelated rows replay fully in parallel.
+If another active transaction already owns the relevant row version, the caller receives:
 
-**What the benchmark actually found:** `bench_recovery` shows *no* speedup
-from extra worker threads on this machine — 2 workers barely help and 4+
-actively regress (see BENCHMARKS.md for numbers). Root cause: each replayed
-op still calls `Table::Begin()`/`Commit()`, which serialize on
-`TransactionManager`'s single mutex — the same bottleneck
-`bench_mvcc_throughput` found independently. Sharding the *data* correctly
-doesn't help when the *apply path* itself has a global lock. This is
-flagged, not hidden: fixing it means giving `RecoveryManager` a bulk-apply
-path that bypasses per-op transaction bookkeeping (safe during recovery,
-since there are no concurrent readers yet), which is the natural next step
-if this project continued.
+```text
+WriteResult::kConflict
+```
 
-## WAL/segment corruption policy: stop, don't skip
+and must abort.
 
-**Decision:** Both `wal::ReadAll` and `Segment::LoadFromFile` stop at the
-first truncated or corrupt record/checksum and discard everything after it,
-rather than trying to skip past the damage and recover what they can
-further on.
+CoreDB does not maintain:
 
-**Why:** once one record's integrity can't be verified, nothing after it in
-a sequentially-dependent log can be trusted either (a corrupt length header
-could make the reader mis-parse every subsequent record as garbage without
-any of them *individually* failing a checksum). "Trust nothing after the
-first bad record" is the conservative, provably-safe policy.
+- lock wait queues
+- a lock manager
+- deadlock detection
+- lock timeouts
 
-**Hardening found by fuzzing the length header in a test:** the first
-version allocated a buffer of the *declared* record length before checking
-it against the file's actual remaining size — a single corrupted 4-byte
-length header could trigger a multi-gigabyte allocation attempt. Fixed by
-checking the declared length against the file size (already known, cheap)
-before allocating. Caught by `tests/crash_recovery/test_wal_corruption.cpp`
-running abnormally slowly under AddressSanitizer (46s for one test, down to
-under 1ms after the fix) — a case where a sanitizer surfaced a real
-robustness bug via a performance anomaly, not a memory-safety error per se.
+### Why
 
-## Checksums cover data + validity + dictionary, not min/max
+Immediate conflict failure keeps the write path deterministic and substantially simpler than introducing blocking lock management.
 
-**Decision:** `Segment`'s per-column CRC32C covers the validity bitmap, the
-typed data block, and (for strings) the dictionary — not the stored
-`min`/`max` bounds.
+The caller is responsible for deciding whether and when to retry.
 
-**Why:** min/max are pruning hints; if one were corrupted, the worst case is
-a segment that should have been prunable isn't (a correctness-preserving,
-performance-only miss — `CanSkip` returning `false` when it "should" return
-`true`), never a false skip that silently drops matching rows, because
-`CanSkip` requires `min`/`max` to be present at all before it will ever
-return `true`, and the check is otherwise pure comparison against real row
-data that *is* checksummed. Covering `min`/`max` too is a reasonable
-follow-up but wasn't necessary for correctness.
+### Consequence
 
-## Benchmark integrity: nothing here reports a number it didn't measure
+Under high contention, transactions may abort frequently instead of waiting for the current writer to finish.
 
-Every figure in BENCHMARKS.md comes from actually running the benchmark
-binary in this repository, on the machine BENCHMARKS.md names, on the date
-it names. Where a number came out worse than expected (JIT initially
-*slower* than a hand-written SIMD kernel; NEON initially *slower* than
-auto-vectorized scalar code for plain `Sum`; MVCC throughput *degrading*
-under more threads), the fix — or the decision not to chase a fix — is
-described above and in BENCHMARKS.md rather than the inconvenient number
-being quietly dropped.
+This behavior is exercised by:
+
+```text
+tests/concurrency/test_aborts.cpp
+```
+
+including the case where concurrent updates to the same row allow only one transaction to succeed.
+
+---
+
+## `row_id` lookup is currently linear
+
+### Decision
+
+CoreDB does not maintain a dedicated index over logical row IDs.
+
+`Table::RowIdExistsInBase` scans the row-ID column of the base segments.
+
+The delta layer also performs a linear scan when locating versions for a `row_id`.
+
+### Why
+
+Adding a hash table or tree is straightforward for physical lookup, but an index used by MVCC must remain consistent with:
+
+- version visibility
+- updates
+- deletes
+- compaction
+- active snapshots
+
+The current implementation keeps the storage model simpler by using the authoritative base and delta structures directly.
+
+### Tradeoff
+
+Lookup cost grows with the number of rows or delta records.
+
+This is particularly visible in update-heavy workloads because each update may scan an increasingly large delta vector.
+
+`bench_mvcc_throughput` therefore runs a background compactor for the update workload so the delta does not grow without bound.
+
+A future implementation could introduce a MVCC-aware `row_id` index to reduce lookup cost.
+
+---
+
+## Compaction rewrites the full base
+
+### Decision
+
+`Table::Compact()` rebuilds one consolidated base representation from:
+
+- existing base rows that remain live
+- delta rows that have become stable
+- deletion state that is safe to apply
+
+It does not use leveled or incremental compaction.
+
+### Why
+
+A full rewrite keeps the merge logic straightforward and makes the interaction with active snapshots easier to reason about.
+
+The compactor only promotes or removes versions once they are safe relative to:
+
+```text
+TransactionManager::OldestActiveSnapshot()
+```
+
+This avoids needing a more complex reclamation mechanism for multiple overlapping storage levels.
+
+### Tradeoff
+
+Compaction cost grows with the size of the base.
+
+`bench_compaction` demonstrates this directly: later rounds take longer as the base accumulates more rows.
+
+The current strategy is therefore simple and correct, but not appropriate for very large continuously growing datasets.
+
+Future options include:
+
+- leveled compaction
+- segmented base storage
+- incremental merge policies
+- epoch-based reclamation
+
+---
+
+## Insert and update workloads use different compaction policies
+
+### Decision
+
+The insert benchmark does not run background compaction.
+
+The update benchmark does.
+
+### Why
+
+`Table::Insert` appends a new delta record and does not need to search for an existing logical row.
+
+Running full-rewrite compaction during a pure insert workload therefore adds work without reducing the cost of the insert operation.
+
+Updates behave differently.
+
+`Table::Update` must locate the current version of a `row_id`, and the current delta implementation performs a linear scan.
+
+Without compaction, an update-heavy workload causes the delta vector to grow continuously, increasing the cost of later updates.
+
+The benchmark policies reflect those different execution paths rather than forcing the same compaction behavior onto both workloads.
+
+---
+
+## Checkpoints require a quiescent point
+
+### Decision
+
+`recovery::WriteCheckpoint` first runs:
+
+```text
+Table::Compact()
+```
+
+then persists the resulting base segments and records the current WAL LSN as:
+
+```text
+last_lsn
+```
+
+The checkpoint mechanism assumes there are no transactions mid-flight while the checkpoint is created.
+
+### Why
+
+If a transaction were active during checkpoint creation, some of its WAL records could appear before `last_lsn` while its changes were not yet represented in the compacted base.
+
+Recovery would then skip those WAL records because they are at or before the checkpoint LSN.
+
+A quiescent checkpoint avoids that ambiguity.
+
+### Alternative
+
+A fuzzy checkpoint design could allow checkpointing concurrently with active transactions.
+
+That would require the recovery process to track additional state describing which pages or logical rows may still need to be reconstructed from the WAL.
+
+CoreDB does not currently implement that machinery.
+
+---
+
+## Recovery reconstructs final committed state, not historical transaction identity
+
+### Decision
+
+`RecoveryManager` identifies WAL operations belonging to transactions with valid `COMMIT` records.
+
+Each surviving operation is then replayed through a new:
+
+```text
+Begin → apply → Commit
+```
+
+sequence.
+
+The original transaction boundaries, transaction IDs, and commit timestamps are not recreated.
+
+### Why
+
+CoreDB's recovery contract is to restore the committed database state before the database becomes available to readers.
+
+The system does not expose historical transaction identifiers or commit timestamps as persistent user-visible state.
+
+Operations from transactions that:
+
+- aborted
+- never committed
+- were interrupted by a crash
+
+are excluded from REDO entirely.
+
+This reconstructs the committed logical state while avoiding the need to reproduce the original MVCC history.
+
+### Tradeoff
+
+Recovered MVCC metadata is not identical to the metadata that existed before the crash.
+
+If CoreDB later needed historical transaction identity, temporal queries, or externally visible commit timestamps, this recovery model would need to change.
+
+---
+
+## Parallel REDO is partitioned by `row_id`
+
+### Decision
+
+Committed recovery operations are assigned to workers using:
+
+```text
+row_id % num_workers
+```
+
+Each worker processes its own bucket in original LSN order.
+
+### Why
+
+Within the current CoreDB data model:
+
+- there are no secondary-index side effects
+- there are no cross-row constraints
+- there are no foreign-key relationships
+- operations on one row do not depend on the state of another row
+
+The important ordering constraint is therefore that operations for the same `row_id` remain ordered.
+
+Partitioning by `row_id` guarantees that all operations for a given row are assigned to the same worker.
+
+### Limitation
+
+The partitioning strategy is logically parallel, but the current apply path still calls:
+
+```text
+Table::Begin()
+Table::Commit()
+```
+
+for each operation.
+
+Those methods serialize through the global `TransactionManager` mutex.
+
+As a result, `bench_recovery` shows that additional recovery workers do not produce useful scaling on the current implementation.
+
+A recovery-specific bulk-apply path could avoid normal per-operation transaction bookkeeping because recovery runs before concurrent readers are admitted.
+
+---
+
+## WAL corruption handling stops at the first invalid record
+
+### Decision
+
+`wal::ReadAll` stops when it encounters:
+
+- a truncated record
+- an invalid length
+- a checksum failure
+
+It does not attempt to skip damaged bytes and continue parsing later records.
+
+### Why
+
+The WAL is a sequential length-prefixed stream.
+
+Once a record boundary can no longer be trusted, the reader cannot safely determine where the next valid record begins.
+
+For example, corruption in a length field could cause all subsequent bytes to be interpreted at incorrect offsets.
+
+Stopping at the first invalid record avoids treating arbitrary later bytes as valid WAL entries.
+
+### Truncated tail
+
+A partially written final record is treated separately from a checksum mismatch.
+
+A truncated tail is consistent with a crash during record append.
+
+Records before the truncated boundary remain valid and recoverable.
+
+---
+
+## WAL record lengths are validated before allocation
+
+### Decision
+
+The WAL reader verifies that a declared record length is plausible relative to the remaining file size before allocating a buffer for the record.
+
+### Why
+
+A corrupted length header could otherwise contain an extremely large integer.
+
+Allocating directly from that value could cause excessive memory allocation even though the WAL file itself contains only a small amount of remaining data.
+
+The reader therefore validates the declared size first.
+
+### How this was discovered
+
+A corruption test became unexpectedly slow under AddressSanitizer because an invalid length field triggered an excessive allocation attempt.
+
+The implementation was changed so record bounds are checked before allocation.
+
+The behavior is covered by:
+
+```text
+tests/crash_recovery/test_wal_corruption.cpp
+```
+
+---
+
+## Segment checksums cover row data, validity, and string dictionaries
+
+### Decision
+
+The per-column CRC32C currently covers:
+
+- the validity bitmap
+- the typed data block
+- the string dictionary where applicable
+
+The stored `min` and `max` metadata are not currently included in the checksum.
+
+### Why
+
+The checksum was initially focused on the data required to reconstruct column values.
+
+However, `min` and `max` values also influence segment pruning.
+
+Because pruning may skip a segment based on these values, corruption of this metadata could affect query correctness rather than only performance.
+
+### Consequence
+
+The current checksum does not provide integrity protection for pruning metadata.
+
+A future format revision should include `min` and `max` in the checksummed representation, or recompute them from verified column data when a segment is loaded.
+
+Until then, the format assumes pruning metadata itself has not been corrupted independently of the checksummed column contents.
+
+---
+
+## Segment pruning remains conservative for valid metadata
+
+### Decision
+
+For the supported predicate:
+
+```text
+column > threshold
+```
+
+CoreDB skips a segment only when:
+
+```text
+segment_max <= threshold
+```
+
+### Why
+
+If the maximum value in a valid segment is at or below the threshold, no row in that segment can satisfy the predicate.
+
+If the metadata is absent, CoreDB does not prune the segment.
+
+This biases the implementation toward scanning additional data rather than skipping a segment without enough information.
+
+The integrity limitation around corrupted `min` / `max` metadata is documented separately above.
+
+---
+
+## Execution benchmarks bypass MVCC
+
+### Decision
+
+The Volcano, vectorized, SIMD, and JIT execution benchmarks operate directly on immutable base segments.
+
+They do not include:
+
+- snapshot materialization
+- delta merging
+- visibility checks
+- transaction bookkeeping
+- compaction
+
+### Why
+
+The purpose of those benchmarks is to compare execution strategies on the same raw query workload.
+
+Including MVCC work would mix storage-engine costs with execution-engine costs and make the comparison harder to interpret.
+
+Transactional scans through `Table` still use the normal MVCC path.
+
+The benchmark separation therefore measures:
+
+```text
+Volcano vs. vectorized vs. JIT
+```
+
+independently from transactional overhead.
+
+---
+
+## The execution engine supports one query shape
+
+### Decision
+
+The execution engine implements:
+
+```sql
+SELECT SUM(aggregate_column)
+WHERE predicate_column > threshold;
+```
+
+over `int64` columns.
+
+### Why
+
+The project focuses on comparing execution strategies rather than building a full query-processing stack.
+
+Supporting one fixed query shape makes it possible to compare:
+
+- row-at-a-time iteration
+- vectorized execution
+- explicit SIMD
+- LLVM-generated native code
+
+on identical work.
+
+### Alternative
+
+A general engine would require additional layers such as:
+
+- expression trees
+- type coercion
+- query planning
+- cost estimation
+- multiple operators
+- joins
+- general aggregation
+
+Those components are outside the current storage-and-execution focus.
+
+---
+
+## SIMD dispatch happens at runtime
+
+### Decision
+
+CoreDB contains separate implementations for:
+
+- scalar execution
+- ARM NEON
+- AVX2
+- AVX-512
+
+The dispatch layer selects the best supported implementation based on runtime CPU capability detection.
+
+### Why
+
+This allows one codebase to support multiple processor architectures without requiring every machine to implement the same instruction set.
+
+Unsupported paths are never executed.
+
+On Apple Silicon, the dispatch layer selects NEON.
+
+On supported x86-64 hosts, AVX2 or AVX-512 may be selected depending on available features.
+
+### Correctness
+
+SIMD implementations are tested against the scalar reference for the tiers available on the current host.
+
+The tests include input sizes that exercise scalar tail handling when the row count is not a multiple of the vector width.
+
+See:
+
+```text
+tests/unit/test_simd_equivalence.cpp
+```
+
+---
+
+## The JIT runs LLVM optimization passes before compilation
+
+### Decision
+
+Generated LLVM IR is passed through an `-O3` optimization pipeline before being handed to ORC `LLJIT`.
+
+CoreDB uses:
+
+```text
+PassBuilder::buildPerModuleDefaultPipeline
+```
+
+### Why
+
+Generating native machine code does not by itself produce an optimized execution path.
+
+The initial implementation passed relatively direct scalar IR to LLJIT and produced only a small improvement over Volcano execution.
+
+Running the standard optimization pipeline substantially improved the generated code.
+
+The benchmark history is documented in [BENCHMARKS.md](BENCHMARKS.md).
+
+---
+
+## The JIT filter loop is branchless
+
+### Decision
+
+The generated filter-and-sum loop uses LLVM `select` instead of a per-row conditional branch.
+
+Conceptually:
+
+```text
+selected = predicate > threshold ? value : 0
+sum += selected
+```
+
+### Why
+
+The benchmark predicate has approximately 50% selectivity.
+
+A branch with a nearly unpredictable outcome performs poorly because the CPU cannot consistently predict which path will be taken.
+
+The branchless form also gives LLVM's loop vectorizer a simpler representation to transform into SIMD instructions.
+
+This change reduced the measured JIT runtime substantially and allowed the generated code to approach the handwritten vectorized path.
+
+See [BENCHMARKS.md](BENCHMARKS.md).
+
+---
+
+## Background compaction uses polling
+
+### Decision
+
+`BackgroundCompactor` periodically checks:
+
+```text
+delta_size() >= threshold
+```
+
+and triggers compaction when the threshold is reached.
+
+### Why
+
+A polling implementation keeps the compactor independent from every individual write operation.
+
+The current design avoids adding notification or scheduling state to the transaction path.
+
+### Tradeoff
+
+Polling introduces a delay between crossing the threshold and starting compaction.
+
+For the current workloads, that delay is acceptable.
+
+A larger system could instead use:
+
+- condition variables
+- work queues
+- adaptive thresholds
+- write-rate-aware scheduling
+
+---
+
+## Recovery verifies segments after replay
+
+### Decision
+
+After recovery completes, CoreDB runs:
+
+```text
+Segment::VerifyIntegrity()
+```
+
+on recovered base segments.
+
+### Why
+
+Checkpoint loading already validates segment checksums, but recovery also mutates the logical database state by applying WAL records.
+
+A final integrity pass provides an explicit verification boundary before the recovered database is considered ready.
+
+This check is separate from WAL checksum validation.
+
+---
+
+## Snapshot isolation is the transaction boundary
+
+### Decision
+
+CoreDB implements snapshot isolation rather than serializable isolation.
+
+A transaction reads from a snapshot determined at `Begin()` and commits its writes if no write-write conflict prevents it.
+
+### Why
+
+Snapshot isolation provides a meaningful MVCC model without introducing:
+
+- predicate locking
+- serializable snapshot isolation
+- read-write dependency tracking
+- full conflict-graph validation
+
+### Limitation
+
+Snapshot isolation does not prevent every anomaly that serializable execution would prevent.
+
+CoreDB's transaction guarantees should therefore be understood specifically as snapshot isolation with write-write conflict detection.
+
+---
+
+## Design priorities
+
+The implementation generally favors:
+
+- explicit invariants
+- deterministic behavior
+- conservative recovery
+- inspectable storage state
+- independently testable execution paths
+- correctness before optimistic parallelism
+- measured performance rather than assumed scaling
+
+Those priorities explain several of the current tradeoffs:
+
+- global transaction synchronization instead of a more complex timestamp oracle
+- full-rewrite compaction instead of a leveled LSM
+- quiescent checkpoints instead of fuzzy checkpoints
+- recovery by committed-state reconstruction instead of full ARIES
+- one query shape instead of a complete planner
+- direct runtime SIMD dispatch instead of architecture-specific builds
+
+The resulting implementation is intentionally narrow, but the boundaries are explicit and the performance consequences of those choices are measured in [BENCHMARKS.md](BENCHMARKS.md).
